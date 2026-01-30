@@ -73,17 +73,26 @@ impl<'a> LineParser<'a> {
         Ok(Some((key, parsed_value)))
     }
 
+    #[inline(always)]
+    fn valid_env_var_character(c: char) -> bool {
+        // POSIX 2018 § 8.1 tells us that environment variables can be any ASCII portable
+        // character other than `=` and `\0`. Because we're loading them from a file, we also
+        // rule out whitespace and control characters
+        // See
+        // <https://pubs.opengroup.org/onlinepubs/9699919799.2018edition/basedefs/V1_chap06.html#tagtcjh_3>
+        // for the range of portable ASCII; it's essentially 0x21 through 0x7e, with some
+        // whitespace that we can ignore
+        c.is_ascii() && c >= '\u{0021}' && c <= '\u{007e}' && c != '='
+    }
+
     fn parse_key(&mut self) -> Result<String> {
         if !self
             .line
-            .starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+            .starts_with(|c| Self::valid_env_var_character(c) && !c.is_numeric())
         {
             return Err(self.err());
         }
-        let index = match self
-            .line
-            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '.'))
-        {
+        let index = match self.line.find(|c| !Self::valid_env_var_character(c)) {
             Some(index) => index,
             None => self.line.len(),
         };
@@ -297,6 +306,8 @@ KEY10  ="whitespace before ="
 KEY11=    "whitespace after ="
 export="export as key"
 export   SHELL_LOVER=1
+export KEYS:CAN:HAVE_COLONS=1
+%TEMP%=/tmp
 "#
             .as_bytes(),
         );
@@ -315,6 +326,8 @@ export   SHELL_LOVER=1
             ("KEY11", "whitespace after ="),
             ("export", "export as key"),
             ("SHELL_LOVER", "1"),
+            ("KEYS:CAN:HAVE_COLONS", "1"),
+            ("%TEMP%", "/tmp"),
         ]
         .into_iter()
         .map(|(key, value)| (key.to_string(), value.to_string()));
@@ -326,7 +339,7 @@ export   SHELL_LOVER=1
             count += 1;
         }
 
-        assert_eq!(count, 13);
+        assert_eq!(count, 15);
     }
 
     #[test]
@@ -605,8 +618,8 @@ mod error_tests {
     }
 
     #[test]
-    fn should_not_allow_dot_as_first_character_of_key() {
-        let wrong_key_value = ".Key=VALUE";
+    fn should_not_allow_number_as_first_character_of_key() {
+        let wrong_key_value = "0Key=VALUE";
 
         let parsed_values: Vec<_> = Iter::new(wrong_key_value.as_bytes()).collect();
 
@@ -629,9 +642,33 @@ mod error_tests {
 
         if let Err(LineParse(wrong_value, index)) = &parsed_values[0] {
             assert_eq!(wrong_value, wrong_format);
-            assert_eq!(*index, 0)
+            assert_eq!(*index, 6)
         } else {
             panic!("Expected the second value not to be parsed")
+        }
+    }
+
+    #[test]
+    fn should_not_parse_invalid_keys() {
+        for (key, bad_index) in [
+            ("0foo", 0),    // starts with a digit, discouraged by posix
+            ("foö", 2),     // trailing unicode
+            ("Πoo", 0),     // leading unicode
+            ("foo\x07", 3), // contains control code
+            ("bar\x00", 3), // contains embedded nul byte
+            ("baz zed", 4), // whitespace
+        ] {
+            let invalid_fmt = format!("{key}=1");
+            let iter = Iter::new(invalid_fmt.as_bytes()).collect::<Vec<_>>();
+
+            assert!(
+                matches!(
+                    iter[0],
+                    Err(LineParse(ref v, idx)) if *v == invalid_fmt && idx == bad_index
+                ),
+                "should fail to parse {:?}",
+                key
+            );
         }
     }
 
